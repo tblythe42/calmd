@@ -4,8 +4,6 @@ from typing import Union, Optional
 import tqdm
 import spotpy
 
-from calmd.database import MultiDimDb
-
 # The following is a template for a Mscua Setup class, this should be modified to connect your specific model to the
 #   calibration scheme.
 # The class name is not really important, only that it contains the following methods (which will be unique to your model
@@ -16,7 +14,7 @@ class MscuaSetup:
     coef = spotpy.parameter.Uniform(low=0.009, high=0.15)
     exp = spotpy.parameter.Uniform(low=1.0, high=4.0)
 
-    def __init__(self, objective_funcs, dbase: Optional[Union[str, Path, MultiDimDb]] = None):
+    def __init__(self, objective_funcs):
         # define the multidimensional parameter space here
         # if using spatial data this would be the number of features you are calibrating
         self.parameter_dimension = 0

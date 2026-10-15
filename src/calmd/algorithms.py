@@ -2,7 +2,6 @@ from typing import Union, Optional
 import copy
 from pathlib import Path
 import inspect
-import warnings
 import shutil
 
 import tqdm
@@ -11,17 +10,18 @@ import xarray as xr
 import dask.array as da
 from dask.diagnostics import ProgressBar
 import zarr
-from rechunker import rechunk
+#from rechunker import rechunk
 import matplotlib.pyplot as plt
 
-from calmd.database import MultiDimDb, MemDb, ZarrDb
-from calmd.sample import LHS_md
-from calmd.obj_funcs import obj_func_direction
-from calmd.utils import build_parameter_list, run_multidim_model_reps
+from calmd.database import MscuaDb
+from calmd.sample import lhs_md, run_multidim_model_reps
+import calmd.obj_funcs as obf
+from calmd.utils import get_params_from_setup, find_chunks, format_numpy_selection
 from calmd._setupbase import MscuaSetup
 from calmd.io_warning import user_warning
+from calmd.parameters import MdList
 
-class MsCua:
+class MsCuaOld:
     algorithm_name = "MSCUA"
 
     def __init__(
@@ -373,6 +373,8 @@ class MsCua:
             dbase.best_sim = best_sim
             dbase.best_params = best_params
             dbase.best_objfun = best_obfn
+            # TODO: need the option here to filter across target variable datasets or leave it as is, which provides
+            #   metrics for each target variable independently
             fil = {}
             for var, stuff in ob.items():
                 fil[var] = {}
@@ -495,6 +497,292 @@ class MsCua:
             fil[k] = filter
 
         return ob, fil
+
+
+class MsCua:
+
+    def __init__(self,
+                 setup: MscuaSetup,
+                 database: str | Path | MscuaDb | None = None,
+                 **kwargs):
+
+        self.setup = setup
+        if isinstance(database, MscuaDb):
+            self.database = database
+        else:
+            self.database = MscuaDb(database, **kwargs)
+
+        for k, v in self.setup.observation_data.items():
+            if np.isnan(v).all(axis=0).any():
+                user_warning(msg=f"At least one column in the '{k}' observation data is missing all values",
+                             frame=inspect.getframeinfo(inspect.currentframe()))
+        self.observation_data = self.setup.evaluation()
+        self.execute = None
+        self.iteration = self.database.active_iteration
+
+    def run_iteration(self,
+                      objfunc_thresh: dict,
+                      caldim_name: str,
+                      reps: int,
+                      iteration_name: str | None = None,
+                      param_source: str | None = None,
+                      min_pfactor: float = 0.35,
+                      min_refparams: int = 25,
+                      save_sims: bool = False,
+                      parallel: str | None = None,
+                      workers: int | None = None):
+        """
+
+        Args:
+            objfunc_thresh:
+            caldim_name:
+            reps:
+            iteration_name:
+            param_source:
+            min_pfactor:
+            min_refparams:
+            save_sims:
+            parallel:
+            workers:
+
+        Returns:
+
+        """
+        root = zarr.open_group(store=self.database.zstore, mode='r+')
+        if iteration_name is None:
+            if self.database.active_iteration is None:
+                raise AttributeError("No active iteration")
+            else:
+                iteration = self.database.active_iteration
+        else:
+            iteration = iteration_name
+
+        if iteration not in list(self.database.root.group_keys()):
+            raise IndexError(f"Iteration: '{iteration}' not found in database")
+
+        self.iteration = iteration
+
+        setup_objfuncs = {}
+        for dk, dv in objfunc_thresh.items():
+            setup_objfuncs[dk] = []
+            for obk in dv.keys():
+                ob_func = getattr(obf, obk)
+                setup_objfuncs[dk].append(ob_func)
+        self.setup.objfuncs = setup_objfuncs
+
+        if param_source is None:
+            param_obs = get_params_from_setup(setup=self.setup)
+        else:
+            param_sel = self.database.get_refined_parameters(iteration=param_source)
+            param_obs = []
+            for park, parv in param_sel.items():
+                dnms = self.database.root[f"{param_source}/Parameters/RefinedSets/{park}"].metadata.dimension_names
+                pob = MdList(name=park, values=parv, dim_names=dnms)
+                param_obs.append(pob)
+        nobs_dict = {name: size.shape[0] for name, size in self.observation_data.items()}
+        self.database.add_iteration(params=param_obs,
+                                    cal_targets=objfunc_thresh,
+                                    caldim_name=caldim_name,
+                                    nobs=nobs_dict,
+                                    reps=reps,
+                                    iter_name=iteration)
+
+        root[f"{iteration}/Thresholds/pfactor"][:] = min_pfactor
+        root[f"{iteration}/Thresholds/min_refined_params"][:] = min_refparams
+
+        if parallel is None:
+            from calmd.execute import Sequential
+
+            self.execute = Sequential(self.simulate)
+        elif parallel == 'multithread':
+            raise NotImplementedError("Multithreading is currently not supported")
+        elif parallel == 'multiprocess':
+            raise NotImplementedError("Multiprocess is currently not supported")
+        else:
+            raise ValueError("The parallel option is not recognized")
+
+        outdas = {}
+        for t in self.database.target_datasets[iteration]:
+            sim_shp = (self.database.dimensions['repetitions'], self.database.dimensions[f'{t}_observations'],
+                       self.database.dimensions[self.database.calibration_dimension[iteration]])
+
+            outdas[t] = da.empty(shape=sim_shp,
+                             chunks=find_chunks(sim_shp, chunks=(1, None, None), dtype='float32'),
+                             dtype=np.float32)
+            if save_sims:
+                self.create_array(path=f"{iteration}/Simulations/{t}",
+                                  dimension_names=[f'{t}_observations', caldim_name],
+                                  shape=sim_shp,
+                                  chunks=find_chunks(sim_shp, chunks=(1, None, None), dtype='float32'))
+
+        nchnks_init = 0
+        for p in self.database.parameter_names[iteration]:
+            nchnks_init += self.database.root[f"{iteration}/Parameters/InitialSamples/{p}"].nchunks_initialized
+            init_p = self.database.get_parameter_samples(param_name=p, iteration=iteration)
+            self.database.save_parameter(param_name=p,
+                                         param_type='refined',
+                                         param_data=init_p,
+                                         iteration=iteration)
+        if nchnks_init == 0:
+            raise ValueError("No parameter samples have been saved to the database")
+
+        param_input = ((r, self.database.get_parameter_samples(iteration=iteration, rep=r)) for r in range(reps))
+        sim_iter = self.execute(param_input)
+
+        for i in tqdm.tqdm(sim_iter, desc='evaluating simulations', leave=False):
+            rep, sim_r = i
+            ob = self.setup.objectivefunction(self.observation_data, sim_r)
+            if not isinstance(ob, dict):
+                raise ValueError(
+                    "The setup class's objective function method did not return a dictionary. "
+                    "A dictionary of objective functions is required.")
+            for vt in sim_r:
+                outdas[vt][i, :, :] = sim_r[vt]
+                if save_sims:
+                    self.database.save_simulation(sim_output_name=vt,
+                                                  sim_data=sim_r[vt],
+                                                  iteration=iteration,
+                                                  rep=rep)
+            for tsk, tsv in ob.items():
+                for obk, obv in tsv.items():
+                    self.database.save_objective_func(obj_func_name=obk,
+                                                      target_dset=tsk,
+                                                      objfunc_data=obv,
+                                                      iteration=iteration,
+                                                      rep=rep)
+        print("Applying Objective Function Thresholds...")
+        for tsk, tsv in self.database.objective_functions[iteration].items():
+            for obk in tsv:
+                obf_vals = self.database.get_objective_func_values(obj_func_name=obk,
+                                                                   target_dset=tsk,
+                                                                   iteration=iteration)
+                obf_mins = np.nanmin(obf_vals, axis=0)
+                obf_norm = obf_vals / obf_mins
+                obf_glob = np.sqrt((1 - obf_norm) ** 2)
+                if self.database.root[f"{iteration}/ObjectiveFunctions/global"].nchunks_initialized == 0:
+                    self.database.insert(path=f"{iteration}/ObjectiveFunctions/global", data=obf_glob)
+                else:
+                    db_glob = self.database.root[f"{iteration}/ObjectiveFunctions/global"]
+                    tot_glob = obf_glob + db_glob
+                    self.database.insert(path=f"{iteration}/ObjectiveFunctions/global", data=tot_glob)
+
+                if obk not in list(objfunc_thresh[tsk].keys()):
+                    raise ValueError(f"No threshold was provided for objective function {obk}.")
+
+                if obf.obj_func_direction[obk] == 'minimize':
+                    obopt_msk = format_numpy_selection(obf_vals.shape, (0, np.nanargmin(obf_vals, axis=0)))
+                    optsim_msk = format_numpy_selection(outdas[tsk].shape, (0, np.nanargmin(obf_vals, axis=0)))
+                    obthresh_msk = np.where(obf_vals > objfunc_thresh[tsk][obk])
+                elif obf.obj_func_direction[obk] == 'maximize':
+                    obopt_msk = format_numpy_selection(obf_vals.shape, (0, np.nanargmax(obf_vals, axis=0)))
+                    optsim_msk = format_numpy_selection(outdas[tsk].shape, (0, np.nanargmax(obf_vals, axis=0)))
+                    obthresh_msk = np.where(obf_vals < objfunc_thresh[tsk][obk])
+                else:
+                    raise ValueError("The objective function threshold direction is not recognized.")
+                self.database.insert(path=f"{iteration}/ObjectiveFunctions/{tsk}/Best{obk}",
+                                     data=np.squeeze(obf_vals[obopt_msk]))
+                self.database.insert(path=f"{iteration}/Simulations/Best/{tsk}/{obk}",
+                                     data=np.squeeze(outdas[tsk][optsim_msk].compute()))
+                for n in self.database.parameter_names[iteration]:
+                    init_p = self.database.get_parameter_samples(param_name=n, iteration=iteration)
+                    self.database.insert(path=f"{iteration}/Parameters/InitialSamples/Best/{tsk}/{obk}/{n}",
+                                         data=np.squeeze(init_p[obopt_msk]))
+                    root = zarr.open_group(store=self.database.zstore, mode='r+')
+                    root[f"{iteration}/Parameters/RefinedSets/{n}"][obthresh_msk] = np.nan
+
+        frst_par = self.database.parameter_names[iteration][0]
+        param_nans = np.isnan(self.database.get_refined_parameters(param_name=frst_par,
+                                                                   iteration=iteration))
+        param_nans_dims = self.database.root[f"{iteration}/Parameters/RefinedSets/{frst_par}"].metadata.dimension_names
+        param_nans_cdimidx = param_nans_dims.index(self.database.calibration_dimension[iteration])
+        refined_param_cnt = np.count_nonzero(~param_nans, axis=0)
+        print(f"Max number of refined parameter sets: {refined_param_cnt.max()}")
+        print(f"Min number of refined parameter sets: {refined_param_cnt.min()}")
+        ref_less_than = np.count_nonzero(refined_param_cnt < min_refparams)
+        # Remove simulations from sim_arr that did not meet objective function thresholds
+
+        ref_sims_idx = np.where(param_nans)
+
+        # save individual 95PPU, p- and r-factors for all observation time series.
+        for var in self.observation_data.keys():
+            print(f"\n{var}")
+            simnan_msk = format_numpy_selection(outdas[var].shape,
+                                                [(0, ref_sims_idx[0]), (2, ref_sims_idx[param_nans_cdimidx])])
+            outdas[var][simnan_msk] = np.nan
+            ## calculate 95PPU here
+            print("  Calculating the 95PPU...")  # this takes a long time for daily series.
+            obs_sd = np.nanstd(self.observation_data[var], axis=0)
+            ppu95 = np.nanquantile(sims_dict[var], [0.025, 0.975], axis=0)
+            lo95ppu[var] = ppu95[0]
+            up95ppu[var] = ppu95[1]
+            print("  Calculating p- and r-factor metrics...")
+            pfac_arr = np.where(
+                (self.observation_data[var] <= up95ppu[var]) & (self.observation_data[var] >= lo95ppu[var]), 1, 0)
+
+            # This avoids artificially low p-factor if there are lots of nans.
+            nan_ind = np.where(np.isnan(self.observation_data[var]))
+            pfac_arr = pfac_arr.astype(float)
+            pfac_arr[nan_ind] = np.nan
+            pfac_cnt = np.nansum(pfac_arr, axis=0)
+            pfactor[var] = pfac_cnt / (~np.isnan(pfac_arr)).sum(axis=0)
+
+            ppu_diff = (up95ppu[var] - lo95ppu[var]).mean(axis=0)
+            rfactor[var] = ppu_diff / obs_sd
+            print(f"  Max p-factor = {pfactor[var].max()}")
+            print(f"  Min p-factor = {pfactor[var].min()}")
+            print(f"  Min r-factor = {np.nanmin(rfactor[var])}")
+            print(f"  Max r-factor = {np.nanmax(rfactor[var])}")
+
+            dbase.ppu_upper = up95ppu
+            dbase.ppu_lower = lo95ppu
+            dbase.pfactor = pfactor
+            dbase.rfactor = rfactor
+
+            # take minimum pfactor from all time series for each valid parameter set.
+            # say something did not meet threshold if any individual time series metric fails.
+            tot_pfactor = np.asarray(list(pfactor.values())).min(axis=0)
+
+            if ref_less_than == 0:
+                print(f"\nAll models retained more refined parameter sets than the minimun: {min_refparams}.")
+                if np.count_nonzero(tot_pfactor < min_pfactor) == 0:
+                    print(f"All models had p-factor greater than {min_pfactor}")
+                else:
+                    print(
+                        f"{np.count_nonzero(tot_pfactor < min_pfactor)} models had a p-factor lower than the allowable minimum: {min_pfactor}. Returning array of failed indexes.")
+                    return np.where(tot_pfactor < min_pfactor)[0]
+            else:
+                print(
+                    f"\n{ref_less_than} models had fewer than the minimum allowable refined parameter sets: {min_refparams}. Either increase the number of samples or exclude these models.")
+                print(f"Returning array of failed model indexes.")
+                if np.count_nonzero(tot_pfactor < min_pfactor) == 0:
+                    print(f"All models had p-factor greater than {min_pfactor}")
+                    return np.where(refined_param_cnt < min_refparams)[0]
+                else:
+                    print(
+                        f"{np.count_nonzero(tot_pfactor < min_pfactor)} models had a p-factor lower than the allowable minimum: {min_pfactor}. Returning array of failed indexes.")
+                    return np.where(tot_pfactor < min_pfactor)[0], np.where(refined_param_cnt < min_refparams)[0]
+
+        else:
+            raise NotImplementedError("Other databases not supported")
+
+    def simulate(self, input_tuple: tuple[int, dict]) -> tuple[int, dict]:
+        idx, params = input_tuple
+
+        try:
+            simres = self.setup.simulation(params=params)
+        except Exception as e:
+            print(f"Simulation {idx} failed: {e}")
+            simres = {}
+            for tds in self.database.target_datasets[self.iteration]:
+                simres[tds] = np.nan
+
+        return idx, simres
+
+    def sample(self):
+        return None
+
+    def evaluate_repitition(self):
+        return None
 
 
 # TODO: Do more enforcement of loading results, make a property with a setter that checks dataset format
